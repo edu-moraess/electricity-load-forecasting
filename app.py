@@ -1,4 +1,5 @@
-"""Electricity Load Forecasting — single-page Streamlit application.
+"""
+Electricity Load Forecasting -- single-page Streamlit application.
 
 Short-term electricity demand forecasting using real operational (ONS) and
 weather (Open-Meteo) data. No synthetic or mocked data is used anywhere in
