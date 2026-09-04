@@ -1,35 +1,42 @@
-"""Peak detection on forecast series."""
+"""
+Peak detection: identify the next forecast peak, its timing, and how it
+compares to the recent average load.
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import numpy as np
 import pandas as pd
 
 
-def detect_next_peak(forecast: pd.DataFrame, recent_avg: float | None = None) -> dict:
-    """Return the maximum forecasted load and its timestamp within the horizon.
+@dataclass
+class PeakInfo:
+    peak_value_mw: float
+    peak_time: pd.Timestamp
+    recent_average_mw: float
+    pct_vs_recent_average: float
 
-    Parameters
-    ----------
-    forecast : DataFrame with at least columns timestamp and p50 (or load_mw).
-    recent_avg : optional recent average load for percentage comparison.
-    """
-    if forecast.empty:
-        raise ValueError("Forecast is empty; cannot detect peak.")
 
-    value_col = "p50" if "p50" in forecast.columns else "load_mw"
-    if value_col not in forecast.columns:
-        raise ValueError(f"Forecast must contain '{value_col}' or 'load_mw'.")
+def detect_next_peak(
+    forecast_timestamps: pd.DatetimeIndex,
+    forecast_values: np.ndarray,
+    recent_history: pd.Series,
+    recent_window: int = 48,
+) -> PeakInfo:
+    if len(forecast_values) == 0:
+        raise ValueError("Cannot detect a peak in an empty forecast")
 
-    idx = forecast[value_col].idxmax()
-    row = forecast.loc[idx]
-    peak_mw = float(row[value_col])
-    peak_time = row["timestamp"] if "timestamp" in forecast.columns else idx
+    idx = int(np.argmax(forecast_values))
+    peak_value = float(forecast_values[idx])
+    peak_time = forecast_timestamps[idx]
 
-    result = {
-        "peak_mw": peak_mw,
-        "peak_time": peak_time,
-    }
-    if recent_avg is not None and recent_avg != 0:
-        result["pct_above_avg"] = 100.0 * (peak_mw - recent_avg) / recent_avg
-    else:
-        result["pct_above_avg"] = float("nan")
-    return result
+    recent_avg = float(recent_history.tail(recent_window).mean())
+    pct_vs_avg = ((peak_value - recent_avg) / recent_avg * 100) if recent_avg else float("nan")
+
+    return PeakInfo(
+        peak_value_mw=peak_value,
+        peak_time=peak_time,
+        recent_average_mw=recent_avg,
+        pct_vs_recent_average=pct_vs_avg,
+    )
