@@ -1,33 +1,39 @@
-"""Temperature scenario analysis (controlled what-if)."""
+"""
+Temperature scenario analysis: shows how the trained model's forecast
+shifts if temperature were offset by a fixed amount, holding all other
+features constant. This is a controlled what-if exercise, not a causal
+claim -- documented as such wherever it is surfaced.
+"""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
+from src.models.lightgbm_model import LightGBMQuantileModel
 
-def run_temperature_scenarios(model, last_row: pd.DataFrame, deltas: list[float] | None = None) -> pd.DataFrame:
-    """Re-run a fitted LightGBM quantile model under temperature shifts.
+SCENARIO_OFFSETS_C = [-2, -1, 0, 1, 2]
 
-    This is a controlled sensitivity exercise, not a causal estimate.
-    """
-    if deltas is None:
-        deltas = [-2.0, -1.0, 0.0, 1.0, 2.0]
+
+def run_temperature_scenarios(
+    model: LightGBMQuantileModel,
+    feature_row: pd.DataFrame,
+    temperature_col: str = "temperature_2m",
+    offsets: list[float] = SCENARIO_OFFSETS_C,
+) -> pd.DataFrame:
+    if temperature_col not in feature_row.columns:
+        raise ValueError(f"'{temperature_col}' not present in the feature row; cannot run scenario")
 
     rows = []
-    base = last_row.copy()
-    temp_col = "temperature_2m"
-    if temp_col not in base.columns:
-        raise ValueError(f"Column '{temp_col}' required for temperature scenarios.")
-
-    for d in deltas:
-        row = base.copy()
-        row[temp_col] = row[temp_col] + d
-        # model is expected to expose predict / predict_quantiles interface
-        if hasattr(model, "predict_quantiles"):
-            preds = model.predict_quantiles(row)
-            p10, p50, p90 = preds["p10"].iloc[0], preds["p50"].iloc[0], preds["p90"].iloc[0]
-        else:
-            p50 = float(model.predict(row)[0])
-            p10 = p50
-            p90 = p50
-        rows.append({"delta_c": d, "p10": p10, "p50": p50, "p90": p90})
+    for offset in offsets:
+        scenario_row = feature_row.copy()
+        scenario_row[temperature_col] = scenario_row[temperature_col] + offset
+        preds = model.predict(scenario_row[model.feature_names_])
+        rows.append(
+            {
+                "temperature_offset_c": offset,
+                "p10": float(preds["P10"].iloc[0]),
+                "p50": float(preds["P50"].iloc[0]),
+                "p90": float(preds["P90"].iloc[0]),
+            }
+        )
     return pd.DataFrame(rows)
