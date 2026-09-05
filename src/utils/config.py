@@ -38,12 +38,19 @@ ONS_CARGA_PROGRAMADA_URL = os.getenv(
 # CKAN portal (used only to resolve/verify resources, not for data itself).
 ONS_CKAN_BASE_URL = os.getenv("ONS_CKAN_BASE_URL", "https://dados.ons.org.br")
 
-# Official ONS subsystem ("área de carga") codes for the SIN.
+# User-facing/internal subsystem labels and the exact ONS API area codes.
+# ONS uses SECO (Sudeste/Centro-Oeste) for the SE/CO submarket.
 ONS_SUBSYSTEMS = {
     "N": "Norte",
     "NE": "Nordeste",
     "S": "Sul",
     "SE": "Sudeste/Centro-Oeste",
+}
+ONS_API_AREA_CODES = {
+    "N": "N",
+    "NE": "NE",
+    "S": "S",
+    "SE": "SECO",
 }
 DEFAULT_SUBSYSTEM = os.getenv("ONS_SUBSYSTEM", "SE")
 
