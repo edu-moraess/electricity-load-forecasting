@@ -17,5 +17,6 @@ def sample_series() -> pd.DataFrame:
 
 
 @pytest.fixture
+
 def sample_load_series(sample_series) -> pd.DataFrame:
     return sample_series[["timestamp", "load_mw"]].copy()
