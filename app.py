@@ -49,88 +49,187 @@ with st.sidebar:
         format_func=lambda k: f"{k} — {ONS_SUBSYSTEMS[k]}",
         index=list(ONS_SUBSYSTEMS.keys()).index("SE"),
     )
-    st.subheader("Training window")
-    lookback_days = st.slider("Lookback days", min_value=30, max_value=180, value=90, step=15)
-    st.subheader("Forecast horizon")
-    horizon_label = st.selectbox(
-        "Horizon",
-        options=list(HORIZONS_MINUTES.keys()),
-        index=2,
-    )
-    run_btn = st.button("Run pipeline", type="primary")
+    lookback_days = st.slider("Training lookback (days)", min_value=90, max_value=365, value=120, step=15)
+    force_refresh = st.button("Force data refresh")
 
-if not run_btn:
-    st.info("Configure the sidebar and click **Run pipeline** to load real ONS + Open-Meteo data and produce forecasts.")
+end_date = date.today()
+start_date = end_date - timedelta(days=lookback_days)
+
+# ---------------------------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------------------------
+try:
+    with st.spinner("Fetching ONS load data and Open-Meteo weather data..."):
+        ingestion = run_ingestion(subsystem, start_date, end_date, force_refresh=force_refresh)
+except IngestionError as exc:
+    st.error(
+        "Data ingestion failed and no cached data is available. "
+        "This is shown as-is, not masked with placeholder data.\n\n"
+        f"Details: {exc}"
+    )
+    st.stop()
+
+status_cols = st.columns([2, 2, 2, 2])
+status_cols[0].metric("Region", f"{subsystem} — {ONS_SUBSYSTEMS[subsystem]}")
+status_cols[1].metric("Last update", ingestion.fetched_at.strftime("%Y-%m-%d %H:%M"))
+status_label = "● LIVE" if not ingestion.from_cache else ("● STALE CACHE" if ingestion.is_stale else "● CACHED")
+status_cols[2].metric("Data status", status_label)
+status_cols[3].metric("Observations", f"{len(ingestion.frame):,}")
+
+if ingestion.source_errors:
+    st.warning(
+        "Some data sources reported problems during this run (shown here rather than "
+        "silently substituted):\n\n" + "\n".join(f"- {e}" for e in ingestion.source_errors)
+    )
+
+with st.expander("Data validation details"):
+    st.write("**Load series:**", ingestion.load_report.summary())
+    st.write("**Weather series:**", ingestion.weather_report.summary())
+    if ingestion.load_report.gaps:
+        st.write("Gaps detected (never filled with invented values):")
+        st.dataframe(pd.DataFrame(ingestion.load_report.gaps))
+
+df = ingestion.frame
+
+min_required_rows = 67 * 48  # ~ (60 train + 7 test) days at 48 periods/day, one fold minimum
+if len(df) < min_required_rows:
+    st.error(
+        f"Only {len(df)} observations available; at least {min_required_rows} are needed for "
+        "walk-forward backtesting with the configured minimum train/test windows. "
+        "Increase the training lookback in the sidebar."
+    )
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Pipeline execution
+# Model tournament (cached per subsystem + data length so it reruns when new
+# data arrives, not on every widget interaction)
 # ---------------------------------------------------------------------------
-end = date.today()
-start = end - timedelta(days=lookback_days)
+@st.cache_resource(show_spinner="Running model tournament (walk-forward backtesting)...")
+def _cached_tournament(subsystem_key: str, n_rows: int, last_ts: str):
+    return run_tournament(df)
 
-with st.spinner("Ingesting ONS load + Open-Meteo weather…"):
-    try:
-        merged = run_ingestion(subsystem=subsystem, start=start, end=end)
-    except IngestionError as exc:
-        st.error(f"Data ingestion failed: {exc}")
-        st.stop()
 
-st.success(f"Loaded {len(merged):,} rows · {merged['timestamp'].min()} → {merged['timestamp'].max()}")
+tournament = _cached_tournament(subsystem, len(df), str(df["timestamp"].max()))
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Subsystem", f"{subsystem} — {ONS_SUBSYSTEMS[subsystem]}")
-col2.metric("Rows", f"{len(merged):,}")
-col3.metric("Mean load (MW)", f"{merged['load_mw'].mean():,.0f}")
+st.subheader("Forecast horizon")
+horizon_label = st.radio(
+    "Horizon", options=list(HORIZONS_MINUTES.keys()), horizontal=True, label_visibility="collapsed"
+)
 
-# Feature matrix
-features = build_feature_matrix(merged)
-feature_cols = get_feature_columns(features)
+# Residuals from the best model's most recent fold, used for residual-bootstrap
+# bands when the winner is not LightGBM.
+best_model = tournament.best_model_name
+recent_fold_errors = tournament.per_fold_metrics[tournament.per_fold_metrics["model"] == best_model]
+residuals_proxy = None
+fitted_lightgbm = None
 
-# Tournament
-with st.spinner("Running model tournament (walk-forward)…"):
-    tournament = run_tournament(features, feature_cols)
+if best_model == "LightGBM":
+    featured_full = build_feature_matrix(df)
+    feature_cols = get_feature_columns(featured_full)
+    fitted_lightgbm = LightGBMQuantileModel()
+    fitted_lightgbm.fit(featured_full[feature_cols], featured_full["load_mw"])
+else:
+    # Approximate residual distribution from the tail of the training data
+    # using a same-day-last-week naive comparison, purely to size the bands.
+    residuals_proxy = (df["load_mw"] - df["load_mw"].shift(48 * 7)).dropna().values
 
-st.subheader("Model tournament (walk-forward WAPE)")
-st.dataframe(tournament["summary"], use_container_width=True)
-best_name = tournament["best_model_name"]
-st.caption(f"Selected model: **{best_name}**")
+forecast = generate_forecast(
+    df, horizon_label, best_model, residuals=residuals_proxy, fitted_lightgbm=fitted_lightgbm
+)
 
-# Forecast
-horizon_min = HORIZONS_MINUTES[horizon_label]
-n_periods = horizon_to_periods(horizon_min, freq_minutes=30)
+st.subheader("Load Forecast")
+chart_df = pd.DataFrame({"timestamp": forecast.timestamps, "P50": forecast.p50})
+if forecast.p10 is not None:
+    chart_df["P10"] = forecast.p10
+    chart_df["P90"] = forecast.p90
 
-with st.spinner(f"Generating {horizon_label} forecast…"):
-    forecast_df = generate_forecast(
-        features,
-        feature_cols,
-        model_name=best_name,
-        n_periods=n_periods,
-        residuals=tournament.get("residuals"),
+history_tail = df.tail(48 * 3)[["timestamp", "load_mw"]].rename(columns={"load_mw": "Historical"})
+plot_df = pd.merge(history_tail, chart_df, on="timestamp", how="outer").sort_values("timestamp")
+st.line_chart(plot_df.set_index("timestamp"))
+if forecast.band_method == "residual_bootstrap":
+    st.caption(
+        "P10/P90 bands are a residual-bootstrap approximation around the winning model's "
+        "point forecast, not full quantile regression (see README § Probabilistic forecasting)."
     )
+elif forecast.band_method == "none":
+    st.caption("No probabilistic bands available for this run (insufficient residual history).")
 
-st.subheader(f"Forecast — {horizon_label}")
-st.line_chart(forecast_df.set_index("timestamp")[["p50", "p10", "p90"]].rename(columns={"p50": "P50", "p10": "P10", "p90": "P90"}))
+peak = detect_next_peak(forecast.timestamps, forecast.p50, df["load_mw"])
+st.subheader("Next Forecast Peak")
+peak_cols = st.columns(3)
+peak_cols[0].metric("Peak load", f"{peak.peak_value_mw:,.1f} MW")
+peak_cols[1].metric("Peak time", peak.peak_time.strftime("%Y-%m-%d %H:%M"))
+peak_cols[2].metric("vs. recent average", f"{peak.pct_vs_recent_average:+.1f}%")
 
-# Peak
-peak = detect_next_peak(forecast_df, recent_avg=merged["load_mw"].tail(48).mean())
-st.metric("Next peak (forecast)", f"{peak['peak_mw']:,.0f} MW", f"{peak['pct_above_avg']:+.1f}% vs 24h avg · {peak['peak_time']}")
+st.subheader("Model Performance")
+st.dataframe(tournament.summary.style.highlight_min(subset=["MAE", "RMSE", "MAPE", "sMAPE", "WAPE"], color="#1f6f43"))
+st.caption(f"Best model (lowest mean WAPE across walk-forward folds): **{best_model}**")
+if tournament.errors:
+    with st.expander("Models that failed during backtesting"):
+        for name, errs in tournament.errors.items():
+            st.write(f"**{name}**: {errs[0]}")
 
-# Error analysis (from backtest residuals if available)
-if "error_frame" in tournament:
-    st.subheader("Error analysis")
-    err = tournament["error_frame"]
-    st.dataframe(error_by_hour(err), use_container_width=True)
+if best_model == "LightGBM" and fitted_lightgbm is not None:
+    st.subheader("Forecast Drivers")
+    importances = fitted_lightgbm.feature_importance().head(10)
+    st.bar_chart(importances)
 
-# Temperature-load
-st.subheader("Temperature × Load (observed)")
-binned = load_by_temperature_bin(merged)
-st.dataframe(binned, use_container_width=True)
-corr = observed_correlation(merged)
-st.caption(f"Pearson correlation (temp vs load): {corr:.3f}")
+st.subheader("Error Analysis")
+last_fold_test_len = tournament.per_fold_metrics["fold"].max()
+# Reconstruct a representative error frame from the most recent backtest fold
+# for the winning model by recomputing point predictions on the held-out window.
+try:
+    from src.evaluation.backtesting import make_walk_forward_folds, iter_fold_frames
 
-# Scenarios (only if LightGBM)
-if best_name.lower().startswith("lightgbm") and "model" in tournament:
-    st.subheader("Temperature scenarios (±2 °C)")
-    scenarios = run_temperature_scenarios(tournament["model"], features, feature_cols)
-    st.dataframe(scenarios, use_container_width=True)
+    folds = make_walk_forward_folds(len(df))
+    last_fold, train_df, test_df = list(iter_fold_frames(df, folds))[-1]
+    last_forecast = generate_forecast(
+        train_df, "24h" if len(test_df) >= horizon_to_periods("24h") else "1h", best_model,
+        residuals=residuals_proxy, fitted_lightgbm=fitted_lightgbm,
+    )
+    n = min(len(last_forecast.p50), len(test_df))
+    err_df = build_error_frame(
+        test_df["timestamp"].values[:n],
+        test_df["load_mw"].values[:n],
+        last_forecast.p50[:n],
+        temperature=test_df["temperature_2m"].values[:n] if "temperature_2m" in test_df else None,
+    )
+    ecol1, ecol2 = st.columns(2)
+    ecol1.bar_chart(error_by_hour(err_df).set_index("hour"))
+    ecol1.caption("Mean absolute error by hour of day (most recent backtest fold)")
+    peak_err = error_during_peaks(err_df)
+    ecol2.metric("Mean abs. error — peak periods", f"{peak_err['peak_mean_abs_error']:.1f} MW")
+    ecol2.metric("Mean abs. error — non-peak periods", f"{peak_err['non_peak_mean_abs_error']:.1f} MW")
+except Exception as exc:  # noqa: BLE001
+    st.info(f"Error analysis unavailable for this run: {exc}")
+
+st.subheader("Temperature–Load Relationship")
+st.caption("Observed relationship in the historical dataset. No causal claim is implied.")
+if "temperature_2m" in df.columns:
+    corr = observed_correlation(df["load_mw"], df["temperature_2m"])
+    st.metric("Correlation (load vs. temperature)", f"{corr:.2f}")
+    binned = load_by_temperature_bin(df["load_mw"], df["temperature_2m"])
+    st.bar_chart(binned.set_index("temperature_bin")["mean_load_mw"])
+
+if best_model == "LightGBM" and fitted_lightgbm is not None:
+    st.subheader("Temperature Scenario")
+    st.caption("Controlled what-if: shifts the most recent observation's temperature and re-forecasts. Not a causal estimate.")
+    featured_full = build_feature_matrix(df)
+    last_row = featured_full.iloc[[-1]]
+    try:
+        scenarios = run_temperature_scenarios(fitted_lightgbm, last_row)
+        st.dataframe(scenarios)
+    except Exception as exc:  # noqa: BLE001
+        st.info(f"Scenario analysis unavailable: {exc}")
+
+st.subheader("Data & Model Status")
+st.write(
+    {
+        "Data source (load)": "ONS — dados.ons.org.br (carga verificada)",
+        "Data source (weather)": "Open-Meteo",
+        "Observations": len(df),
+        "Training period": f"{df['timestamp'].min()} → {df['timestamp'].max()}",
+        "Last observation": str(df["timestamp"].max()),
+        "Best model": best_model,
+    }
+)
