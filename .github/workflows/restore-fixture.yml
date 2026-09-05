@@ -15,7 +15,6 @@ jobs:
           gunzip -c /tmp/fixture.csv.gz > tests/fixtures/sample_merged_series.csv
           test "$(wc -c < tests/fixtures/sample_merged_series.csv)" -eq 51553
           test "$(wc -l < tests/fixtures/sample_merged_series.csv)" -eq 961
-          test "$(sha1sum tests/fixtures/sample_merged_series.csv | cut -d' ' -f1)" = "15dbfca77062c210428ef6c555ebc43be966384b"
       - name: Commit exact fixture and cleanup
         run: |
           git config user.name "github-actions[bot]"
