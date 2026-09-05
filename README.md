@@ -9,7 +9,7 @@ Interconnected System (SIN) using real, publicly available data: verified load
 from ONS (Operador Nacional do Sistema Elétrico) and weather observations from
 Open-Meteo. It compares baseline, statistical, and machine-learning forecasters
 under a single, leakage-free walk-forward backtesting methodology, and serves
- the result through one Streamlit page.
+the result through one Streamlit page.
 
 No synthetic, mocked, or fabricated data is used anywhere — if a data source is
 unavailable, the app surfaces the error instead of hiding it behind a fallback.
