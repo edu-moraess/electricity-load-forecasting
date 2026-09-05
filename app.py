@@ -209,7 +209,17 @@ if "temperature_2m" in df.columns:
     corr = observed_correlation(df["load_mw"], df["temperature_2m"])
     st.metric("Correlation (load vs. temperature)", f"{corr:.2f}")
     binned = load_by_temperature_bin(df["load_mw"], df["temperature_2m"])
-    st.bar_chart(binned.set_index("temperature_bin")["mean_load_mw"])
+    # Altair/Streamlit does not reliably serialize pandas Interval categories
+    # as a bar-chart axis on newer pandas/Altair combinations. Keep the
+    # interval labels intact as strings and pass the axis explicitly.
+    if not binned.empty:
+        binned["temperature_bin"] = binned["temperature_bin"].astype(str)
+        st.bar_chart(
+            binned,
+            x="temperature_bin",
+            y="mean_load_mw",
+            sort=False,
+        )
 
 if best_model == "LightGBM" and fitted_lightgbm is not None:
     st.subheader("Temperature Scenario")
