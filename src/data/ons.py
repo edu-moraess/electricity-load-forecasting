@@ -7,19 +7,21 @@ Confirmed live request pattern (verified 2026-09):
     https://apicarga.ons.org.br/prd/cargaverificada
         ?dat_inicio=YYYY-MM-DD&dat_fim=YYYY-MM-DD&cod_areacarga=AREA
 
-Where AREA is one of the SIN subsystem codes: N, NE, S, SE (see
-src.utils.config.ONS_SUBSYSTEMS). This module intentionally does NOT
-hardcode the exact JSON field names returned by the API: ONS has changed
-field naming between dataset versions before, and guessing wrong would
-silently produce garbage data. Instead, `_normalize_records` inspects the
-real response and matches columns by pattern, logging exactly what it
-found. If it cannot confidently identify a timestamp column and a load
-value column, it raises `OnsDataError` with the raw keys included, rather
-than fabricating data.
+Where AREA is one of the SIN subsystem area codes: SECO (Sudeste/Centro-Oeste),
+N (Norte), NE (Nordeste), S (Sul). The application keeps "SE" as its internal
+label and maps it to the official ONS API code "SECO".
 
-No synthetic fallback is used anywhere in this module. If the API is
-unreachable or returns no data for the requested window, that is surfaced
-to the caller as an exception -- never silently replaced with mock values.
+This module intentionally does NOT hardcode the exact JSON field names returned
+by the API: ONS has changed field naming between dataset versions before, and
+guessing wrong would silently produce garbage data. Instead, `_normalize_records`
+inspects the real response and matches columns by pattern, logging exactly what
+it found. If it cannot confidently identify a timestamp column and a load value
+column, it raises `OnsDataError` with the raw keys included, rather than
+fabricating data.
+
+No synthetic fallback is used anywhere in this module. If the API is unreachable
+or returns no data for the requested window, that is surfaced to the caller as
+an exception -- never silently replaced with mock values.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ import pandas as pd
 import requests
 
 from src.utils.config import (
+    ONS_API_AREA_CODES,
     ONS_CARGA_VERIFICADA_URL,
     ONS_SUBSYSTEMS,
     REQUEST_MAX_RETRIES,
@@ -45,7 +48,14 @@ logger = get_logger(__name__)
 # schema the API returns. Based on ONS's documented naming conventions
 # (din_* for datetime fields, val_* for numeric values).
 _TIMESTAMP_CANDIDATES = ("din_instante", "din_referencia", "data", "timestamp", "instante")
-_LOAD_VALUE_CANDIDATES = ("val_cargaenergiahomwmed", "val_carga", "carga", "val_cons", "valor")
+_LOAD_VALUE_CANDIDATES = (
+    "val_cargaglobalcons",
+    "val_cargaenergiahomwmed",
+    "val_carga",
+    "carga",
+    "val_cons",
+    "valor",
+)
 _SUBSYSTEM_CANDIDATES = ("id_subsistema", "nom_subsistema", "cod_areacarga", "subsistema", "area")
 
 
@@ -140,7 +150,7 @@ def fetch_load_series(subsystem: str, start_date: date, end_date: date) -> OnsLo
     params = {
         "dat_inicio": start_date.isoformat(),
         "dat_fim": end_date.isoformat(),
-        "cod_areacarga": subsystem,
+        "cod_areacarga": ONS_API_AREA_CODES[subsystem],
     }
     logger.info("Requesting ONS load data: %s", params)
     response = _request_with_retries(ONS_CARGA_VERIFICADA_URL, params)
