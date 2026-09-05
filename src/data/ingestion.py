@@ -11,6 +11,7 @@ used and clearly flagged as stale -- never silently treated as fresh.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
