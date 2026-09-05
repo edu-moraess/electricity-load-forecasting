@@ -61,9 +61,25 @@ def _save_cache(subsystem: str, frame: pd.DataFrame) -> None:
 
 
 def _merge_load_and_weather(load_df: pd.DataFrame, weather_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge semi-hourly load onto hourly weather via as-of (backward) join."""
-    load_sorted = load_df.sort_values("timestamp")
-    weather_sorted = weather_df.sort_values("timestamp")
+    """Merge semi-hourly load onto hourly weather via as-of (nearest) join.
+
+    ONS timestamps are UTC-aware, while Open-Meteo returns naive wall-clock
+    timestamps when requested in America/Sao_Paulo. Normalize both sides to
+    UTC before merge_asof; pandas requires compatible datetime dtypes.
+    """
+    load_sorted = load_df.sort_values("timestamp").copy()
+    weather_sorted = weather_df.sort_values("timestamp").copy()
+
+    load_sorted["timestamp"] = pd.to_datetime(load_sorted["timestamp"], utc=True)
+    weather_ts = pd.to_datetime(weather_sorted["timestamp"])
+    if weather_ts.dt.tz is None:
+        weather_ts = weather_ts.dt.tz_localize("America/Sao_Paulo").dt.tz_convert("UTC")
+    else:
+        weather_ts = weather_ts.dt.tz_convert("UTC")
+    weather_sorted["timestamp"] = weather_ts
+
+    load_sorted = load_sorted.sort_values("timestamp")
+    weather_sorted = weather_sorted.sort_values("timestamp")
     merged = pd.merge_asof(
         load_sorted,
         weather_sorted,
