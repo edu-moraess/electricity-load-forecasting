@@ -12,10 +12,10 @@ src.utils.config.ONS_SUBSYSTEMS). This module intentionally does NOT
 hardcode the exact JSON field names returned by the API: ONS has changed
 field naming between dataset versions before, and guessing wrong would
 silently produce garbage data. Instead, `_normalize_records` inspects the
-real response and matches columns by pattern, logging exactly what it found.
-If it cannot confidently identify a timestamp column and a load value column,
-it raises `OnsDataError` with the raw keys included, rather than fabricating
-data.
+real response and matches columns by pattern, logging exactly what it
+found. If it cannot confidently identify a timestamp column and a load
+value column, it raises `OnsDataError` with the raw keys included, rather
+than fabricating data.
 
 No synthetic fallback is used anywhere in this module. If the API is
 unreachable or returns no data for the requested window, that is surfaced
@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import requests
@@ -68,7 +68,7 @@ def _request_with_retries(url: str, params: dict) -> requests.Response:
             response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response
-        except requests.RequestException as exc:
+        except requests.RequestException as exc:  # network error, timeout, 4xx/5xx
             last_exc = exc
             logger.warning(
                 "ONS request failed (attempt %d/%d): %s", attempt, REQUEST_MAX_RETRIES, exc
