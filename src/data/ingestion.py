@@ -6,12 +6,11 @@ rerun.
 
 Cache policy: a cached file is reused if it is younger than
 CACHE_TTL_MINUTES (see src.utils.config). Otherwise a fresh ingestion is
-attempted. If ingestion fails and a (stale) cache exists, the stale cache is
-used and clearly flagged as stale -- never silently treated as fresh.
+attempted. If ingestion fails and a (stale) cache exists, the stale cache
+is used and clearly flagged as stale -- never silently treated as fresh.
 """
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
