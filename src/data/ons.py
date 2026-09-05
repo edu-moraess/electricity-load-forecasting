@@ -7,10 +7,19 @@ Confirmed live request pattern (verified 2026-09):
     https://apicarga.ons.org.br/prd/cargaverificada
         ?dat_inicio=YYYY-MM-DD&dat_fim=YYYY-MM-DD&cod_areacarga=AREA
 
-ONS does not publish a stable machine-readable schema for the JSON field
-names of this endpoint. This client therefore detects the timestamp and
-load-value columns by pattern from the live response and raises a clear
-OnsDataError (including the raw column list) if it cannot identify them.
+Where AREA is one of the SIN subsystem codes: N, NE, S, SE (see
+src.utils.config.ONS_SUBSYSTEMS). This module intentionally does NOT
+hardcode the exact JSON field names returned by the API: ONS has changed
+field naming between dataset versions before, and guessing wrong would
+silently produce garbage data. Instead, `_normalize_records` inspects the
+real response and matches columns by pattern, logging exactly what it found.
+If it cannot confidently identify a timestamp column and a load value column,
+it raises `OnsDataError` with the raw keys included, rather than fabricating
+data.
+
+No synthetic fallback is used anywhere in this module. If the API is
+unreachable or returns no data for the requested window, that is surfaced
+to the caller as an exception -- never silently replaced with mock values.
 """
 from __future__ import annotations
 
@@ -32,17 +41,16 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Candidate column name patterns (lowercased) used for schema auto-detection.
-_TIMESTAMP_CANDIDATES = [
-    "din_instante", "dat_instante", "timestamp", "data", "datetime", "hora", "instante",
-]
-_LOAD_CANDIDATES = [
-    "val_cargaverificada", "val_carga", "carga", "load", "valor", "mw", "potencia",
-]
+# Candidate substrings for auto-detecting the relevant columns in whatever
+# schema the API returns. Based on ONS's documented naming conventions
+# (din_* for datetime fields, val_* for numeric values).
+_TIMESTAMP_CANDIDATES = ("din_instante", "din_referencia", "data", "timestamp", "instante")
+_LOAD_VALUE_CANDIDATES = ("val_cargaenergiahomwmed", "val_carga", "carga", "val_cons", "valor")
+_SUBSYSTEM_CANDIDATES = ("id_subsistema", "nom_subsistema", "cod_areacarga", "subsistema", "area")
 
 
 class OnsDataError(RuntimeError):
-    """Raised when the ONS API is unreachable or the response schema is unrecognizable."""
+    """Raised when the ONS API is unreachable or returns an unrecognized schema."""
 
 
 @dataclass
@@ -50,7 +58,7 @@ class OnsLoadSeries:
     subsystem: str
     start_date: date
     end_date: date
-    frame: pd.DataFrame  # columns: timestamp, load_mw
+    frame: pd.DataFrame  # columns: timestamp (UTC-naive, local America/Sao_Paulo), load_mw
 
 
 def _request_with_retries(url: str, params: dict) -> requests.Response:
@@ -63,82 +71,92 @@ def _request_with_retries(url: str, params: dict) -> requests.Response:
         except requests.RequestException as exc:
             last_exc = exc
             logger.warning(
-                "ONS request failed (attempt %d/%d): %s",
-                attempt,
-                REQUEST_MAX_RETRIES,
-                exc,
+                "ONS request failed (attempt %d/%d): %s", attempt, REQUEST_MAX_RETRIES, exc
             )
             if attempt < REQUEST_MAX_RETRIES:
                 time.sleep(REQUEST_RETRY_BACKOFF_SECONDS * attempt)
-    raise OnsDataError(
-        f"Failed to reach ONS API at {url} after {REQUEST_MAX_RETRIES} attempts"
-    ) from last_exc
+    raise OnsDataError(f"Failed to reach ONS API at {url} after {REQUEST_MAX_RETRIES} attempts") from last_exc
 
 
-def _detect_columns(raw: list[dict]) -> tuple[str, str]:
-    if not raw:
-        raise OnsDataError("ONS response is an empty list")
-    sample = raw[0]
-    keys = list(sample.keys())
-    lower_map = {k.lower(): k for k in keys}
+def _find_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    lower_map = {c.lower(): c for c in columns}
+    for candidate in candidates:
+        for lower_name, original in lower_map.items():
+            if candidate in lower_name:
+                return original
+    return None
 
-    ts_col = None
-    for cand in _TIMESTAMP_CANDIDATES:
-        if cand in lower_map:
-            ts_col = lower_map[cand]
-            break
-    load_col = None
-    for cand in _LOAD_CANDIDATES:
-        if cand in lower_map:
-            load_col = lower_map[cand]
-            break
+
+def _normalize_records(records: list[dict], subsystem: str) -> pd.DataFrame:
+    if not records:
+        raise OnsDataError(
+            f"ONS API returned zero records for subsystem '{subsystem}'. "
+            "This can mean the requested window has no published data yet, "
+            "or the area code is not accepted by the current API version. "
+            "No synthetic data will be substituted."
+        )
+
+    df = pd.DataFrame.from_records(records)
+    columns = list(df.columns)
+
+    ts_col = _find_column(columns, _TIMESTAMP_CANDIDATES)
+    load_col = _find_column(columns, _LOAD_VALUE_CANDIDATES)
 
     if ts_col is None or load_col is None:
         raise OnsDataError(
-            f"Could not detect timestamp/load columns in ONS response. "
-            f"Raw columns: {keys}"
+            "Could not identify timestamp/load columns in the ONS API response. "
+            f"Columns returned by the API: {columns}. "
+            "Update src/data/ons.py candidate lists to match the current schema "
+            "instead of guessing -- inspect one live response first."
         )
-    logger.info("ONS response schema detected: timestamp=%r, load=%r", ts_col, load_col)
-    return ts_col, load_col
+
+    logger.info("ONS response schema detected: timestamp='%s', load='%s'", ts_col, load_col)
+
+    out = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(df[ts_col], errors="coerce"),
+            "load_mw": pd.to_numeric(df[load_col], errors="coerce"),
+        }
+    )
+    n_before = len(out)
+    out = out.dropna(subset=["timestamp"])
+    n_after = len(out)
+    if n_after < n_before:
+        logger.warning("Dropped %d rows with unparseable timestamps", n_before - n_after)
+
+    out = out.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+    return out
 
 
-def fetch_load_series(
-    subsystem: str,
-    start_date: date,
-    end_date: date,
-) -> OnsLoadSeries:
+def fetch_load_series(subsystem: str, start_date: date, end_date: date) -> OnsLoadSeries:
+    """Fetch verified load (carga verificada) for one SIN subsystem and date range.
+
+    Raises OnsDataError if the API is unreachable or the schema cannot be
+    parsed. Never returns fabricated data.
+    """
     if subsystem not in ONS_SUBSYSTEMS:
-        raise OnsDataError(f"Unknown subsystem {subsystem!r}; expected one of {list(ONS_SUBSYSTEMS)}")
+        raise ValueError(f"Unknown subsystem '{subsystem}'. Valid: {sorted(ONS_SUBSYSTEMS)}")
 
     params = {
         "dat_inicio": start_date.isoformat(),
         "dat_fim": end_date.isoformat(),
         "cod_areacarga": subsystem,
     }
+    logger.info("Requesting ONS load data: %s", params)
     response = _request_with_retries(ONS_CARGA_VERIFICADA_URL, params)
-    payload = response.json()
 
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise OnsDataError(f"ONS API returned non-JSON content: {response.text[:200]}") from exc
+
+    # The API may return either a bare list or an envelope like {"data": [...]}.
     if isinstance(payload, dict):
-        # Some ONS endpoints wrap the list
-        for key in ("data", "dados", "items", "result"):
-            if key in payload and isinstance(payload[key], list):
-                payload = payload[key]
-                break
+        records = payload.get("data") or payload.get("results") or []
+    else:
+        records = payload
 
-    if not isinstance(payload, list):
-        raise OnsDataError(f"Unexpected ONS response type: {type(payload)}")
-
-    if not payload:
-        raise OnsDataError("ONS returned an empty list for the requested window")
-
-    ts_col, load_col = _detect_columns(payload)
-    frame = pd.DataFrame(payload)
-    frame = frame[[ts_col, load_col]].rename(columns={ts_col: "timestamp", load_col: "load_mw"})
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-    frame["load_mw"] = pd.to_numeric(frame["load_mw"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp", "load_mw"]).sort_values("timestamp").reset_index(drop=True)
-
-    if frame.empty:
-        raise OnsDataError("ONS response contained no usable timestamp/load rows after parsing")
+    frame = _normalize_records(records, subsystem)
+    logger.info("Fetched %d ONS observations for subsystem %s", len(frame), subsystem)
 
     return OnsLoadSeries(subsystem=subsystem, start_date=start_date, end_date=end_date, frame=frame)
